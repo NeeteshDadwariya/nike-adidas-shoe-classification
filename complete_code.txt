@@ -1,0 +1,516 @@
+import numpy as np
+from sklearn.metrics import multilabel_confusion_matrix
+
+def sq_err(prediction, actual):
+    squared_err = np.power(prediction - actual, 2)
+    return 0.5 * np.sum(squared_err)
+
+
+def get_metrics(pred, true):
+    cm = multilabel_confusion_matrix(true, pred)
+    return (cm)import numpy as np
+
+def activation(x, f):
+    return f(x)
+
+def sigmoid(X):
+    return 1 / (1 + np.exp(-X))
+
+def sigmoid_dash(x):
+    sig = sigmoid(x)
+    return sig * (1 - sig)# -*- coding: utf-8 -*-
+
+
+### Installing necessary libraries
+"""
+
+!pip install pyspark
+
+"""### Downloading project code from Github"""
+
+!rm -rf CS6350-Big-Data-Management-and-Analytics
+!git clone https://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@github.com/NeeteshDadwariya/CS6350-Big-Data-Management-and-Analytics.git
+!mv CS6350-Big-Data-Management-and-Analytics/Project/* .
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+import os
+import time
+
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+from pyspark.sql import *
+from keras.utils.np_utils import to_categorical
+from activation_layers import *
+from cost_functions import *
+from derivatives import *
+from forward_layers import *
+
+
+"""### Initialzing spark session"""
+
+spark = SparkSession.builder\
+    .master("local[*]")\
+    .getOrCreate()
+sc = spark.sparkContext
+spark
+
+!wget https://publiclyhosteddata.s3.amazonaws.com/nike-adidas-dataset.zip
+!unzip -o -q nike-adidas-dataset.zip
+
+base_dir = 'nike-adidas-dataset'
+train_dir = f'{base_dir}/train'
+test_dir = f'{base_dir}/test'
+val_dir = f'{base_dir}/validation'
+
+BATCH_SIZE = 500
+IMG_SIZE = (150, 150)
+SEED = 123
+
+def get_img_ds_from_dir(dir):
+    return tf.keras.utils.image_dataset_from_directory(dir,
+                                                       batch_size=BATCH_SIZE,
+                                                       image_size=IMG_SIZE,
+                                                       seed=SEED)
+
+
+train_ds = get_img_ds_from_dir(train_dir)
+val_ds = get_img_ds_from_dir(val_dir)
+test_ds = get_img_ds_from_dir(test_dir)
+
+def display(dataset, cmap=None):
+    plt.figure(figsize=(10, 10))
+    for images, labels in dataset.take(1):
+      for i in range(9):
+        ax = plt.subplot(3, 3, i + 1)
+        plt.imshow(images[i].numpy().astype("uint8"), cmap=cmap)
+        plt.title(class_labels[labels[i]])
+        plt.axis("off")
+
+    plt.show()
+
+display(train_ds)
+
+"""### Image Preprocessing"""
+
+def image_preprocessing(image, label):
+    image = tf.image.rgb_to_grayscale(image)
+    image = tf.keras.layers.Rescaling(1. / 255)(image)
+    return (image, label)
+
+train_ds_processed = train_ds.map(image_preprocessing)
+val_ds_processed = val_ds.map(image_preprocessing)
+test_ds_processed = test_ds.map(image_preprocessing)
+
+class_labels = train_ds.class_names
+print(class_labels)
+
+flatten_image_size = IMG_SIZE[0] * IMG_SIZE[1]
+
+def flatten(images):
+    return images.reshape(-1, flatten_image_size)
+
+def get_label_array(label):
+    return to_categorical([label], num_classes=len(class_labels), dtype=int)
+
+def get_image_data(dataset):
+    image_data = []
+    for images, labels in dataset.as_numpy_iterator():
+        for image, label in zip(flatten(images), labels):
+            key = image.reshape(1, flatten_image_size)
+            value = get_label_array(label).tolist()
+            image_data.append((key, value))
+    return image_data
+
+
+image_data = get_image_data(train_ds_processed)
+train_rdd = sc.parallelize(image_data)
+train_rdd.take(1)
+
+"""### Model constants"""
+
+# Input layer consists of flatten image size neurons
+input_layer = flatten_image_size
+
+# Since there are two classes, the output layer consists of 2 neurons
+output_layer = len(class_labels)
+
+"""### Model mapping functions"""
+
+def apply_forward1(x, weights1, bias1):
+    image_data, label = x
+    forward1_op = preforward(image_data, weights1, bias1)
+    return (image_data, forward1_op, label)
+
+def apply_sigmoid1(x):
+    image_data, forward1_op, label = x
+    activation1_op = activation(forward1_op, sigmoid)
+    return (image_data, forward1_op, activation1_op, label)
+
+def apply_forward2(x, weights2, bias2):
+    image_data, forward1_op, activation1_op, label = x
+    forward2_op = preforward(activation1_op, weights2, bias2)
+    return (image_data, forward1_op, activation1_op, forward2_op, label)
+
+def apply_sigmoid2(x):
+    image_data, forward1_op, activation1_op, forward2_op, label = x
+    label_pred = activation(forward2_op, sigmoid)
+    return (image_data, forward1_op, activation1_op, forward2_op, label_pred, label)
+
+def calc_der_err_wrt_b2(x):
+    image_data, forward1_op, activation1_op, forward2_op, label_pred, label = x
+    error = sq_err(label_pred, label)
+    der_err_wrt_b2 = get_der_err_wrt_b2(label_pred, label, forward2_op, sigmoid_dash)
+    correct_prediction = int(np.argmax(label_pred) == np.argmax(label))
+    return (image_data, forward1_op, activation1_op, error, der_err_wrt_b2, correct_prediction)
+
+def calc_der_err_wrt_w2(x):
+    image_data, forward1_op, activation1_op, error, der_err_wrt_b2, correct_prediction = x
+    der_err_wrt_w2 = get_der_err_wrt_w2(activation1_op, der_err_wrt_b2)
+    return (image_data, forward1_op, error, der_err_wrt_b2, der_err_wrt_w2, correct_prediction)
+
+def calc_der_err_wrt_b1(x, weights2):
+    image_data, forward1_op, error, der_err_wrt_b2, der_err_wrt_w2, correct_prediction = x
+    der_err_wrt_b1 = get_der_err_wrt_b1(forward1_op,  der_err_wrt_b2, weights2, sigmoid_dash)
+    return (image_data, error, der_err_wrt_b2, der_err_wrt_w2, der_err_wrt_b1, correct_prediction)
+
+def calc_der_err_wrt_w1(x):
+    image_data, error, der_err_wrt_b2, der_err_wrt_w2, der_err_wrt_b1, correct_prediction = x
+    der_err_wrt_w1 = get_der_err_wrt_w1(image_data, der_err_wrt_b1)
+    return (error, der_err_wrt_b2, der_err_wrt_w2, der_err_wrt_b1, der_err_wrt_w1, correct_prediction, 1)
+
+def update_weights_and_bias(learning_rate, weights1, weights2, bias1, bias2,
+                            der_err_wrt_b2, der_err_wrt_w2, der_err_wrt_b1, der_err_wrt_w1, image_count):
+    new_bias2 = bias2 -  (learning_rate * (der_err_wrt_b2 / image_count))
+    new_weight2 = weights2 - (learning_rate * (der_err_wrt_w2 / image_count))
+    new_bias1 = bias1 - (learning_rate * (der_err_wrt_b1 / image_count))
+    new_weight1 = weights1 - (learning_rate * (der_err_wrt_w1 / image_count))
+
+    return (new_weight1, new_bias1, new_weight2, new_bias2)
+
+def reduce_fun(x, y):
+    error_x, der_err_wrt_b2_x, der_err_wrt_w2_x, der_err_wrt_b1_x, der_err_wrt_w1_x, correct_prediction_x, count_x = x
+    error_y, der_err_wrt_b2_y, der_err_wrt_w2_y, der_err_wrt_b1_y, der_err_wrt_w1_y, correct_prediction_y, count_y = y
+
+    error = error_x + error_y
+    der_err_wrt_b2 = der_err_wrt_b2_x + der_err_wrt_b2_y
+    der_err_wrt_w2 = der_err_wrt_w2_x + der_err_wrt_w2_y
+    der_err_wrt_b1 = der_err_wrt_b1_x + der_err_wrt_b1_y
+    der_err_wrt_w1 = der_err_wrt_w1_x + der_err_wrt_w1_y
+    correct_predictions = correct_prediction_x + correct_prediction_y
+    image_count = count_x + count_y
+
+    return (error, der_err_wrt_b2, der_err_wrt_w2, der_err_wrt_b1, der_err_wrt_w1, correct_predictions, image_count)
+
+def get_random_weights(from_range, to_range, initial_bias):
+  return np.random.rand(from_range, to_range) - initial_bias
+
+
+"""### Model training"""
+
+# Fit method takes model hyperparameters
+def fit(iterations, learning_rate, hidden_layer):
+
+  initial_bias = 0.5
+
+  # Get random initial weights
+  weights1 = get_random_weights(input_layer, hidden_layer, initial_bias)
+  weights2 = get_random_weights(hidden_layer, output_layer, initial_bias)
+  bias1 = get_random_weights(1, hidden_layer, initial_bias)
+  bias2 = get_random_weights(1, output_layer, initial_bias)
+
+  print(f"--------------------Hidden layers={hidden_layer}, Rate={learning_rate}, Max Iterations={iterations} --------------------")
+
+  accuracies = []
+  errors = []
+
+  start_time = time.time()
+
+  for i in range(iterations):
+
+      iter_start_time = time.time()
+      dnn_iteration_outcomes = train_rdd \
+          .map(lambda x: apply_forward1(x, weights1, bias1)) \
+          .map(lambda x: apply_sigmoid1(x)) \
+          .map(lambda x: apply_forward2(x, weights2, bias2)) \
+          .map(lambda x: apply_sigmoid2(x)) \
+          .map(lambda x: calc_der_err_wrt_b2(x)) \
+          .map(lambda x: calc_der_err_wrt_w2(x)) \
+          .map(lambda x: calc_der_err_wrt_b1(x, weights2)) \
+          .map(lambda x: calc_der_err_wrt_w1(x)) \
+          .reduce(reduce_fun)
+
+      (error, der_err_wrt_b2, der_err_wrt_w2, der_err_wrt_b1, der_err_wrt_w1, correct_predictions, image_count) = dnn_iteration_outcomes
+      iteration_error = error / image_count
+      iteration_accuracy = correct_predictions / image_count
+
+      accuracies.append(iteration_accuracy)
+      errors.append(iteration_error)
+
+      iter_time_taken = time.time() - iter_start_time
+    
+      weights1, bias1, weights2, bias2 = \
+          update_weights_and_bias(learning_rate, weights1, weights2, bias1, bias2,
+                                  der_err_wrt_b2, der_err_wrt_w2, der_err_wrt_b1, 
+                                  der_err_wrt_w1, image_count)
+
+  time_taken = time.time() - start_time
+
+  # Performance metrices
+  print(f"   Iterations: {iterations} | Accuracy: {accuracies[-1]:.4f} | Error: {errors[-1]:.4f} | Time taken: {time_taken:.0f}s")
+  print("--------------------------------------------------------------------------------------------------------------------")
+
+  return weights1, weights2, bias1, bias2, accuracies, errors
+
+"""### Model predictions"""
+
+test_image_data = get_image_data(test_ds_processed)
+test_rdd = sc.parallelize(test_image_data)
+
+display(test_ds)
+
+def predict(x, weights1, bias1, weights2, bias2):
+    forward1_op = preforward(x, weights1, bias1)
+    activation1_op = sigmoid(forward1_op)
+    forward2_op = preforward(activation1_op, weights2, bias2)
+    prediction = sigmoid(forward2_op)
+    return prediction
+
+def prediction_mapper(x, weights1, bias1, weights2, bias2):
+  image_data, label = x
+  prediction = predict(image_data, weights1, bias1, weights2, bias2)
+  error = sq_err(prediction, label)
+  correct_prediction = int(np.argmax(prediction) == np.argmax(label))
+  return (correct_prediction, error, 1)
+
+def prediction_reducer(x, y):
+    correct_prediction_x, error_x, count_x = x
+    correct_prediction_y, error_y, count_y = y
+
+    return (correct_prediction_x + correct_prediction_y, error_x + error_y, count_x + count_y)
+
+"""### Hyperparameter Tuning"""
+
+max_iterations = [10, 20, 30]
+learning_rates = [0.1, 0.2, 0.3]
+hidden_layers = [32, 64, 128]
+
+i = 0
+
+plt.subplots(len(hidden_layers), len(learning_rates), figsize=(15, 15))
+plt.suptitle(f"Accuracy vs Iteration Curve") 
+
+model_params = []
+
+for hidden_layer in hidden_layers:
+  for learning_rate in learning_rates:
+    i+=1
+    plt.subplot(len(hidden_layers), len(learning_rates), i)
+    for iteration in max_iterations:
+      
+      # Model training
+      weights1, weights2, bias1, bias2, train_accuracies, train_errors = fit(iteration, learning_rate, hidden_layer)
+
+      # Model prediction
+      total_error, correct_predictions, count = test_rdd\
+        .map(lambda x: prediction_mapper(x, weights1, bias1, weights2, bias2))\
+        .reduce(prediction_reducer)
+
+      test_error = total_error / count
+      test_accuracy = correct_predictions / count
+
+      model_params.append({
+          'max_iterations': iteration,
+          'rate': learning_rate,
+          'hidden_layers': hidden_layer,
+          'train_loss': np.min(train_errors),
+          'train_accuracy': np.max(train_accuracies),
+          'test_accuracy': test_accuracy
+      })
+
+      label=f"iteration={iteration}"
+      plt.ylim([0.5, 1])
+      plt.plot(train_accuracies, label=label)  
+
+    plt.title(f"Hidden Layers={hidden_layer}, Rate={learning_rate}")
+    plt.xlabel("No of Iterations")
+    plt.ylabel("Training Accuracy")
+
+"""### Best Model Parameters"""
+
+params_df = pd.DataFrame(model_params)
+best_tuning_params = params_df.loc[params_df['train_accuracy'].idxmax()]
+print("Best Model Parameters:")
+print(best_tuning_params.to_dict())
+
+"""### Model parameters tabularization"""
+
+params_df.head(100)# -*- coding: utf-8 -*-
+
+### Installing necessary libraries
+"""
+
+import findspark
+findspark.init()
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+from pyspark.sql import *
+from pyspark.ml import Pipeline
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.mllib.evaluation import BinaryClassificationMetrics, MulticlassMetrics
+from pyspark.ml import Pipeline
+from sklearn.metrics import ConfusionMatrixDisplay
+from sklearn.metrics import accuracy_score, f1_score, precision_score
+
+"""### Initializing spark session"""
+
+spark = SparkSession.builder \
+    .master("local[*]") \
+    .config("spark.driver.memory", "6g") \
+    .config("spark.jars.packages", "databricks:spark-deep-learning:1.5.0-spark2.4-s_2.11") \
+    .getOrCreate()
+sc = spark.sparkContext
+spark
+
+"""### Downloading images"""
+
+# !wget https://publiclyhosteddata.s3.amazonaws.com/nike-adidas-dataset.zip
+# !unzip -o -q nike-adidas-dataset.zip
+
+base_dir = 'nike-adidas-dataset'
+train_dir = f'{base_dir}/train'
+test_dir = f'{base_dir}/test'
+partition_size = 100
+
+class_names = ['adidas', 'nike']
+
+def create_image_df(dir):
+    adidas_df = spark.read.format("image").load(f"{dir}/{class_names[0]}").withColumn("label", lit(0))
+    nike_df = spark.read.format("image").load(f"{dir}/{class_names[1]}").withColumn("label", lit(1))
+
+    return adidas_df.unionAll(nike_df)
+
+train_df = create_image_df(train_dir)
+test_df = create_image_df(test_dir)
+
+# Repartitioning data so because each partition would be loaded in memory individually.
+train_df = train_df.repartition(partition_size)
+test_df = test_df.repartition(partition_size)
+
+"""### Displaying sample images"""
+
+def display(dataframe, cmap=None):
+    plt.figure(figsize=(10, 10))
+    for i, img in enumerate(dataframe.limit(9).collect()):
+        ax = plt.subplot(3, 3, i + 1)
+        data = img[0].data
+        channels = img[0].nChannels
+        height = img[0].height
+        width = img[0].width
+        array = np.frombuffer(data, dtype=np.uint8).reshape(height, width, channels)
+        label = 'Adidas' if img.label == 0 else 'Nike'
+        plt.imshow(array, cmap=cmap)
+        plt.title(label)
+        plt.axis("off")
+
+    plt.show()
+
+display(train_df)
+
+"""### Model training"""
+
+from sparkdl import DeepImageFeaturizer
+
+pipeline = Pipeline(stages=[
+    DeepImageFeaturizer(inputCol="image", outputCol="features", modelName="InceptionV3"),
+    LogisticRegression(elasticNetParam=0.3, maxIter=10, regParam=0.05, labelCol="label")
+])
+
+# Fitting the model
+model = pipeline.fit(train_df)
+
+"""### Model prediction"""
+
+prediction_df = model.transform(test_df)
+evaluator = MulticlassClassificationEvaluator(metricName="accuracy")
+prediction_metrics_df = prediction_df.select("prediction", "label")
+accuracy = evaluator.evaluate(prediction_metrics_df)
+print(f"Accuracy on test data: {accuracy}")
+
+"""### Model Evaluation"""
+
+prediction_metrics_data = prediction_metrics_df.collect()
+preds = [item[0] for item in prediction_metrics_data]
+labels = [item[1] for item in prediction_metrics_data]
+pred_names = [class_names[int(item[0])] for item in prediction_metrics_data]
+label_names = [class_names[int(item[1])] for item in prediction_metrics_data]
+
+ConfusionMatrixDisplay.from_predictions(label_names, pred_names, labels=class_names, normalize='true', cmap=plt.cm.Blues)
+
+"""####"""
+
+from sklearn.metrics import accuracy_score, f1_score, precision_score
+import matplotlib.pyplot as plt
+
+accuracy = accuracy_score(labels, preds)
+f1_score = f1_score(labels, preds)
+precision = precision_score(labels, preds)
+
+# Create barplot
+fig, ax = plt.subplots()
+metrics = ['Accuracy', 'F-1 Score', 'Precision']
+scores = [accuracy, f1_score, precision]
+bars = ax.bar(metrics, scores)
+for bar in bars:
+    yval = float("{:.2f}".format(bar.get_height()))
+    plt.text(bar.get_x() + 0.3, yval + .01, yval)
+ax.set_title('Model Performance Metrics')
+plt.show()import numpy as np
+
+
+from activation_layers import sigmoid
+
+"""
+Forward layer
+"""
+
+
+def preforward(x, w, b):
+    return np.dot(x, w) + b
+
+
+"""
+Prediction function
+"""
+
+
+def predict(x, W1, B1, W2, B2):
+    forward_op1 = preforward(x, W1, B1)
+    activation_op1 = sigmoid(forward_op1)
+    forward_op2 = preforward(activation_op1, W2, B2)
+    prediction = sigmoid(forward_op2)
+    return prediction
+
+
+def get_der_err_wrt_b2(prediction, actual, y_h, f_dash):
+    return (prediction - actual) * f_dash(y_h)
+
+def get_der_err_wrt_w2(h, der_err_wrt_b2):
+    return np.dot(h.T, der_err_wrt_b2)
+
+def get_der_err_wrt_b1(h_h, der_err_wrt_b2, weights2, f_dash):
+    return np.dot(der_err_wrt_b2, weights2.T) * f_dash(h_h)
+
+def get_der_err_wrt_w1(x, der_err_wrt_b1):
+    return np.dot(x.T, der_err_wrt_b1)
